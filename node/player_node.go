@@ -571,12 +571,6 @@ func (pn *PlayerNode) autoStartGame() {
 	// Check peer connection count (more reliable early on)
 	connectedPeers := pn.Network.ConnectedPeerCount()
 
-	// Only log occasionally to avoid spam
-	if pn.Log.NextSlot()%5 == 0 {
-		log.Printf("[Coordinator Debug] Alive: %d/%d, Connected peers: %d/%d",
-			aliveCount, config.NumNodes, connectedPeers, config.NumNodes-1)
-	}
-
 	// Check if we should start
 	shouldStart := false
 	quorumToUse := config.NumNodes
