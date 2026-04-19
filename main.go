@@ -43,38 +43,59 @@ func main() {
 	pn := node.NewPlayerNode(nodeID, config.DefaultRoleMap)
 
 	// ── UI callbacks ──────────────────────────────────────────────────────────
+
+	// Track last known phase to detect changes
+	var lastPhase config.Phase = config.PhaseLobby
+	var lastWinner string = ""
+
 	pn.OnStateChange = func(gs *game.GameState) {
-		winner := "TBD"
-		if gs.Winner != "" {
-			winner = gs.Winner
-		}
-		fmt.Printf("\n[STATE] Phase=%-6s  Day=%d  Alive=%v  Winner=%s\n",
-			gs.Phase, gs.DayNumber, gs.AliveIDs(), winner)
+		// Only show full state update if phase changed or game ended
+		phaseChanged := gs.Phase != lastPhase
+		gameEnded := gs.Winner != "" && lastWinner == ""
 
-		// Show announcements (eliminations, night results)
-		for _, announcement := range gs.Announcements {
-			fmt.Printf("  📢 %s\n", announcement)
-		}
-
-		// Show phase-specific instructions
-		if gs.Winner == "" {
-			switch gs.Phase {
-			case config.PhaseDay:
-				fmt.Printf("\n💬 DAY PHASE: Discuss and vote to eliminate a suspect.\n")
-				fmt.Printf("   Commands: speak <msg> | vote <id>\n\n")
-			case config.PhaseNight:
-				if pn.Role.HasNightAction() {
-					fmt.Printf("\n🌙 NIGHT PHASE: Perform your secret action.\n")
-					fmt.Printf("   Commands: night <id>\n\n")
-				} else {
-					fmt.Printf("\n🌙 NIGHT PHASE: Wait while others act in secret...\n\n")
-				}
-			case config.PhaseLobby:
-				fmt.Printf("\n⏳ LOBBY: Waiting for game to start...\n\n")
+		if phaseChanged || gameEnded {
+			winner := "TBD"
+			if gs.Winner != "" {
+				winner = gs.Winner
 			}
+			fmt.Printf("\n[STATE] Phase=%-6s  Day=%d  Alive=%v  Winner=%s\n",
+				gs.Phase, gs.DayNumber, gs.AliveIDs(), winner)
+
+			// Show announcements (eliminations, night results)
+			for _, announcement := range gs.Announcements {
+				fmt.Printf("  📢 %s\n", announcement)
+			}
+
+			// Show phase-specific instructions
+			if gs.Winner == "" {
+				switch gs.Phase {
+				case config.PhaseDay:
+					fmt.Printf("\n💬 DAY PHASE: Discuss and vote to eliminate a suspect.\n")
+					fmt.Printf("   Commands: speak <msg> | vote <id>\n\n")
+				case config.PhaseNight:
+					if pn.Role.HasNightAction() {
+						fmt.Printf("\n🌙 NIGHT PHASE: Perform your secret action.\n")
+						fmt.Printf("   Commands: night <id>\n\n")
+					} else {
+						fmt.Printf("\n🌙 NIGHT PHASE: Wait while others act in secret...\n\n")
+					}
+				case config.PhaseLobby:
+					fmt.Printf("\n⏳ LOBBY: Waiting for game to start...\n\n")
+				}
+			} else {
+				fmt.Printf("\n🎮 GAME OVER! %s wins!\n", winner)
+				fmt.Printf("   Game will reset in 20 seconds...\n\n")
+			}
+
+			lastPhase = gs.Phase
+			lastWinner = gs.Winner
 		} else {
-			fmt.Printf("\n🎮 GAME OVER! %s wins!\n", winner)
-			fmt.Printf("   Game will reset in 20 seconds...\n\n")
+			// Just show announcements for non-phase-change events
+			if len(gs.Announcements) > 0 {
+				for _, announcement := range gs.Announcements {
+					fmt.Printf("  📢 %s\n", announcement)
+				}
+			}
 		}
 	}
 

@@ -209,9 +209,19 @@ func (pn *PlayerNode) Vote(targetID int) bool {
 	if pn.Phase() != config.PhaseDay {
 		return false
 	}
+
+	// Check if voter (this node) is alive
+	voter, ok := pn.State().Players[pn.NodeID]
+	if !ok || !voter.IsAlive {
+		log.Printf("[Node %d] dead players cannot vote", pn.NodeID)
+		return false
+	}
+
+	// Check if target is alive
 	if p, ok := pn.State().Players[targetID]; !ok || !p.IsAlive {
 		return false
 	}
+
 	log.Printf("[Node %d] Voting to eliminate %d", pn.NodeID, targetID)
 	return pn.Paxos.Propose(map[string]any{"target_id": targetID}, "VOTE", config.QuorumSize)
 }
@@ -224,6 +234,14 @@ func (pn *PlayerNode) PerformNightAction(targetID int) bool {
 	if pn.Phase() != config.PhaseNight {
 		return false
 	}
+
+	// Check if this node is still alive
+	p, ok := pn.State().Players[pn.NodeID]
+	if !ok || !p.IsAlive {
+		log.Printf("[Node %d] cannot act - player is dead", pn.NodeID)
+		return false
+	}
+
 	if !pn.Role.HasNightAction() {
 		return false
 	}
@@ -262,15 +280,21 @@ func (pn *PlayerNode) PerformNightAction(targetID int) bool {
 // participation check and the quorum once the failure detector marks it dead.
 func (pn *PlayerNode) ProposePhaseChange(newPhase config.Phase) bool {
 	// ── Barrier check ─────────────────────────────────────────────────────────
-	aliveMap := pn.Network.AliveNodes()
-	// AliveNodes returns peer IDs only; add self
-	aliveSet := make(map[int]bool, len(aliveMap)+1)
-	for id, alive := range aliveMap {
-		if alive {
-			aliveSet[id] = true
+	// Get alive players from GAME STATE (not network heartbeat status)
+	gameState := pn.State()
+	alivePlayers := gameState.AlivePlayers()
+
+	// Get network alive status
+	networkAlive := pn.Network.AliveNodes()
+
+	// Only wait for players who are BOTH alive in game AND connected to network
+	aliveSet := make(map[int]bool)
+	for _, p := range alivePlayers {
+		// Check if connected (or is self)
+		if p.NodeID == pn.NodeID || networkAlive[p.NodeID] {
+			aliveSet[p.NodeID] = true
 		}
 	}
-	aliveSet[pn.NodeID] = true
 	aliveCount := len(aliveSet)
 
 	pn.participationMu.RLock()
@@ -547,47 +571,72 @@ func (pn *PlayerNode) autoStartGame() {
 	// Check peer connection count (more reliable early on)
 	connectedPeers := pn.Network.ConnectedPeerCount()
 
-	log.Printf("[Coordinator Debug] Alive: %d/%d, Connected peers: %d/%d",
-		aliveCount, config.NumNodes, connectedPeers, config.NumNodes-1)
+	// Only log occasionally to avoid spam
+	if pn.Log.NextSlot()%5 == 0 {
+		log.Printf("[Coordinator Debug] Alive: %d/%d, Connected peers: %d/%d",
+			aliveCount, config.NumNodes, connectedPeers, config.NumNodes-1)
+	}
 
 	// Check if we should start
 	shouldStart := false
+	quorumToUse := config.NumNodes
 
 	// Initial start: all peers connected and log is empty
 	if connectedPeers >= config.NumNodes-1 && pn.Log.Len() == 0 {
 		shouldStart = true
+		quorumToUse = config.NumNodes
 	}
 
-	// After reset: all peers connected and last action was GAME_RESET
+	// After reset: use current connected count (some may have disconnected)
 	lastSlot := pn.Log.NextSlot() - 1
-	if lastSlot >= 0 && connectedPeers >= config.NumNodes-1 {
+	if lastSlot >= 0 && connectedPeers >= config.QuorumSize-1 { // At least quorum connected
 		if entry, ok := pn.Log.Get(lastSlot); ok {
 			if entry.ActionType == "GAME_RESET" {
 				shouldStart = true
+				// Use actual alive count for quorum, not fixed NumNodes
+				quorumToUse = aliveCount
 			}
 		}
 	}
 
 	if shouldStart {
-		log.Printf("[Coordinator] All %d nodes connected - starting game", config.NumNodes)
+		log.Printf("[Coordinator] Starting game with %d nodes (quorum=%d)", aliveCount, quorumToUse)
 
 		// Wait a bit for heartbeats to propagate so all nodes are marked alive
 		time.Sleep(3 * time.Second)
 
-		// Use a fixed quorum of NumNodes for initial phase change
-		// (not dynamic alive count which might be incomplete due to heartbeat delay)
+		// Use dynamic quorum based on who's actually connected
 		payload := map[string]any{"new_phase": config.PhaseDay.String()}
-		pn.Paxos.Propose(payload, "PHASE_CHANGE", config.NumNodes)
+		pn.Paxos.Propose(payload, "PHASE_CHANGE", quorumToUse)
 	}
 }
 
 // autoTallyAndEliminate checks if all alive players have voted, then tallies and eliminates.
 func (pn *PlayerNode) autoTallyAndEliminate() {
 	s := pn.State()
-	alive := s.AliveIDs()
 
-	// Wait for all alive players to vote
-	if len(s.Votes) < len(alive) {
+	// Get players alive in game state
+	gameAlive := s.AliveIDs()
+
+	// Get network alive status (who's actually connected)
+	networkAlive := pn.Network.AliveNodes()
+
+	// Only wait for players who are BOTH alive in game AND connected to network
+	expectedVoters := make([]int, 0)
+	for _, id := range gameAlive {
+		// Check if this player is connected (or is self)
+		if id == pn.NodeID || networkAlive[id] {
+			expectedVoters = append(expectedVoters, id)
+		}
+	}
+
+	// Wait for all connected alive players to vote
+	if len(s.Votes) < len(expectedVoters) {
+		// Only log occasionally to avoid spam
+		if pn.Log.NextSlot()%5 == 0 {
+			log.Printf("[Coordinator Debug] Votes: %d/%d (need votes from: %v)",
+				len(s.Votes), len(expectedVoters), expectedVoters)
+		}
 		return // Not everyone has voted yet
 	}
 
@@ -631,23 +680,34 @@ func (pn *PlayerNode) autoTallyAndEliminate() {
 func (pn *PlayerNode) autoResolveNight() {
 	s := pn.State()
 
-	// Check if all Mafia and Doctor players have acted
+	// Get network alive status
+	networkAlive := pn.Network.AliveNodes()
+
+	// Check if all Mafia and Doctor players (who are connected) have acted
 	pn.participationMu.RLock()
 	allActed := true
+	expectedActors := make([]int, 0)
 	for _, p := range s.Players {
 		if !p.IsAlive {
 			continue
 		}
 		if p.Role == config.RoleMafia || p.Role == config.RoleDoctor {
-			if !pn.nightActed[p.NodeID] {
-				allActed = false
-				break
+			// Only wait if they're connected (or self)
+			if p.NodeID == pn.NodeID || networkAlive[p.NodeID] {
+				expectedActors = append(expectedActors, p.NodeID)
+				if !pn.nightActed[p.NodeID] {
+					allActed = false
+				}
 			}
 		}
 	}
 	pn.participationMu.RUnlock()
 
 	if !allActed {
+		// Only log occasionally to avoid spam
+		if pn.Log.NextSlot()%5 == 0 {
+			log.Printf("[Coordinator Debug] Night actions: waiting for %v", expectedActors)
+		}
 		return // Wait for everyone
 	}
 
