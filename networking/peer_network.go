@@ -40,7 +40,7 @@ type PeerNetwork struct {
 
 	// Callbacks
 	vcSnapshotFn func() []int // injected by PlayerNode
-	nodeDeadFn   func(int)   // injected by PlayerNode
+	nodeDeadFn   func(int)    // injected by PlayerNode
 
 	listener net.Listener
 	stopCh   chan struct{}
@@ -170,6 +170,13 @@ func (n *PeerNetwork) AliveNodes() map[int]bool {
 		result[id] = alive
 	}
 	return result
+}
+
+// ConnectedPeerCount returns the number of peers with active TCP connections.
+func (n *PeerNetwork) ConnectedPeerCount() int {
+	n.peersMu.Lock()
+	defer n.peersMu.Unlock()
+	return len(n.peers)
 }
 
 // ── Server (inbound) ──────────────────────────────────────────────────────────

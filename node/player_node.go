@@ -21,6 +21,7 @@ import (
 	"mafia-p2p/networking"
 	"mafia-p2p/node/roles"
 	"sync"
+	"time"
 )
 
 // PlayerNode is the main object for one player in the distributed game.
@@ -40,7 +41,7 @@ type PlayerNode struct {
 	SM   *game.StateMachine
 
 	// Optional callbacks (set by the UI layer)
-	OnStateChange func(*game.GameState) // called after each log commit
+	OnStateChange func(*game.GameState)           // called after each log commit
 	OnMessage     func(senderID int, text string) // called on SPEAK messages
 
 	// ── Phase-change participation tracking ──────────────────────────────────
@@ -53,9 +54,12 @@ type PlayerNode struct {
 	//
 	// Both sets are keyed by node ID and updated from the Paxos commit callback,
 	// so every node maintains identical tracking from the same shared log.
-	participationMu  sync.RWMutex
-	spokeOrVoted     map[int]bool // Day participation
-	nightActed       map[int]bool // Night participation
+	participationMu sync.RWMutex
+	spokeOrVoted    map[int]bool // Day participation
+	nightActed      map[int]bool // Night participation
+
+	// ── Game automation ──────────────────────────────────────────────────────
+	coordinatorStopCh chan struct{}
 
 	started bool
 }
@@ -77,17 +81,18 @@ func NewPlayerNode(nodeID int, roleMap [config.NumNodes]config.Role) *PlayerNode
 	sm := game.NewStateMachine(roleMap)
 
 	pn := &PlayerNode{
-		NodeID:       nodeID,
-		VC:           vc,
-		Log:          al,
-		Network:      net,
-		CsSpeak:      csSpeak,
-		CsNight:      csNight,
-		Paxos:        paxos,
-		Role:         myRole,
-		SM:           sm,
-		spokeOrVoted: make(map[int]bool),
-		nightActed:   make(map[int]bool),
+		NodeID:            nodeID,
+		VC:                vc,
+		Log:               al,
+		Network:           net,
+		CsSpeak:           csSpeak,
+		CsNight:           csNight,
+		Paxos:             paxos,
+		Role:              myRole,
+		SM:                sm,
+		spokeOrVoted:      make(map[int]bool),
+		nightActed:        make(map[int]bool),
+		coordinatorStopCh: make(chan struct{}),
 	}
 
 	// Register the Paxos commit callback — single source of truth for all state updates.
@@ -139,11 +144,30 @@ func (pn *PlayerNode) Start() error {
 	pn.Network.RegisterHandler(networking.MsgSyncRequest, pn.onSyncRequest)
 	pn.Network.RegisterHandler(networking.MsgSyncResponse, pn.onSyncResponse)
 
-	return pn.Network.Start()
+	// Start the game coordinator goroutine
+	go pn.coordinatorLoop()
+
+	if err := pn.Network.Start(); err != nil {
+		return err
+	}
+
+	// After network starts, request sync from peers to catch up
+	// (in case we're rejoining after a disconnect)
+	go func() {
+		time.Sleep(2 * time.Second) // Wait for connections to establish
+		if pn.Log.Len() == 0 {
+			// Empty log means we might be behind, request sync
+			log.Printf("[Node %d] Empty log on startup, requesting sync", pn.NodeID)
+			pn.RequestSync()
+		}
+	}()
+
+	return nil
 }
 
 // Stop shuts down all connections and goroutines.
 func (pn *PlayerNode) Stop() {
+	close(pn.coordinatorStopCh)
 	pn.Network.Stop()
 	log.Printf("[Node %d] stopped", pn.NodeID)
 }
@@ -227,7 +251,8 @@ func (pn *PlayerNode) PerformNightAction(targetID int) bool {
 //
 // DAY → NIGHT  requires every alive node to have committed a SPEAK or VOTE.
 // NIGHT → DAY  requires every alive node with a night action (Mafia, Doctor)
-//              to have committed a NIGHT_ACTION.
+//
+//	to have committed a NIGHT_ACTION.
 //
 // If the barrier is not yet satisfied the call returns false immediately —
 // the coordinator should retry after each new log commit.
@@ -334,6 +359,11 @@ func (pn *PlayerNode) trackParticipation(entry distributed.LogEntry) {
 		// the new phase starts with a clean participation slate.
 		pn.spokeOrVoted = make(map[int]bool)
 		pn.nightActed = make(map[int]bool)
+
+	case "GAME_RESET":
+		// Reset participation tracking for new game
+		pn.spokeOrVoted = make(map[int]bool)
+		pn.nightActed = make(map[int]bool)
 	}
 }
 
@@ -415,6 +445,248 @@ func (pn *PlayerNode) RequestSync() {
 	msg := networking.NewSyncRequest(pn.NodeID, ts, fromSlot)
 	pn.Network.Broadcast(msg)
 	log.Printf("[Node %d] Sync requested from slot %d", pn.NodeID, fromSlot)
+}
+
+// ── Game Coordinator & Automation ─────────────────────────────────────────────
+
+// coordinatorLoop runs in background and orchestrates the game flow.
+// Only the lowest-ID alive node acts as coordinator to avoid duplicate proposals.
+func (pn *PlayerNode) coordinatorLoop() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-pn.coordinatorStopCh:
+			return
+		case <-ticker.C:
+			if !pn.shouldCoordinate() {
+				continue
+			}
+			pn.checkAndAdvanceGame()
+		}
+	}
+}
+
+// shouldCoordinate returns true if this node should act as coordinator.
+// The lowest-ID alive node coordinates to avoid duplicate proposals.
+func (pn *PlayerNode) shouldCoordinate() bool {
+	alive := pn.State().AliveIDs()
+	if len(alive) == 0 {
+		return false
+	}
+	// Sort to find lowest ID
+	minID := alive[0]
+	for _, id := range alive {
+		if id < minID {
+			minID = id
+		}
+	}
+	return minID == pn.NodeID
+}
+
+// checkAndAdvanceGame checks current phase and advances the game if conditions are met.
+func (pn *PlayerNode) checkAndAdvanceGame() {
+	s := pn.State()
+
+	// Check win condition first
+	if s.Winner != "" {
+		// Game has ended - wait 20 seconds then reset
+		lastSlot := pn.Log.NextSlot() - 1
+		if lastSlot >= 0 {
+			if entry, ok := pn.Log.Get(lastSlot); ok {
+				// Check if we already proposed a reset
+				if entry.ActionType == "GAME_RESET" {
+					return // Reset already in progress
+				}
+
+				// Check if enough time has passed since game end
+				timeSinceEnd := time.Since(time.Unix(0, entry.WallTime))
+				if timeSinceEnd > 20*time.Second {
+					log.Printf("[Coordinator] Game ended %v ago - resetting game", timeSinceEnd.Round(time.Second))
+					pn.ProposeGameReset()
+				}
+			}
+		}
+		return
+	}
+
+	switch s.Phase {
+	case config.PhaseLobby:
+		// Auto-start the game after all nodes connect
+		pn.autoStartGame()
+
+	case config.PhaseDay:
+		// Check if we should tally votes and eliminate
+		pn.autoTallyAndEliminate()
+
+	case config.PhaseNight:
+		// Check if we should resolve night actions
+		pn.autoResolveNight()
+	}
+}
+
+// autoStartGame transitions from LOBBY to DAY once all nodes are connected.
+func (pn *PlayerNode) autoStartGame() {
+	// Only start if we're in LOBBY phase
+	if pn.State().Phase != config.PhaseLobby {
+		return
+	}
+
+	// Check both alive status and connection count
+	aliveMap := pn.Network.AliveNodes()
+
+	// Count alive peers
+	aliveCount := 1 // self
+	for _, isAlive := range aliveMap {
+		if isAlive {
+			aliveCount++
+		}
+	}
+
+	// Check peer connection count (more reliable early on)
+	connectedPeers := pn.Network.ConnectedPeerCount()
+
+	log.Printf("[Coordinator Debug] Alive: %d/%d, Connected peers: %d/%d",
+		aliveCount, config.NumNodes, connectedPeers, config.NumNodes-1)
+
+	// Check if we should start
+	shouldStart := false
+
+	// Initial start: all peers connected and log is empty
+	if connectedPeers >= config.NumNodes-1 && pn.Log.Len() == 0 {
+		shouldStart = true
+	}
+
+	// After reset: all peers connected and last action was GAME_RESET
+	lastSlot := pn.Log.NextSlot() - 1
+	if lastSlot >= 0 && connectedPeers >= config.NumNodes-1 {
+		if entry, ok := pn.Log.Get(lastSlot); ok {
+			if entry.ActionType == "GAME_RESET" {
+				shouldStart = true
+			}
+		}
+	}
+
+	if shouldStart {
+		log.Printf("[Coordinator] All %d nodes connected - starting game", config.NumNodes)
+
+		// Wait a bit for heartbeats to propagate so all nodes are marked alive
+		time.Sleep(3 * time.Second)
+
+		// Use a fixed quorum of NumNodes for initial phase change
+		// (not dynamic alive count which might be incomplete due to heartbeat delay)
+		payload := map[string]any{"new_phase": config.PhaseDay.String()}
+		pn.Paxos.Propose(payload, "PHASE_CHANGE", config.NumNodes)
+	}
+}
+
+// autoTallyAndEliminate checks if all alive players have voted, then tallies and eliminates.
+func (pn *PlayerNode) autoTallyAndEliminate() {
+	s := pn.State()
+	alive := s.AliveIDs()
+
+	// Wait for all alive players to vote
+	if len(s.Votes) < len(alive) {
+		return // Not everyone has voted yet
+	}
+
+	// Check if an elimination has already been processed
+	// (by checking if the last log entry is ELIMINATE)
+	lastSlot := pn.Log.NextSlot() - 1
+	if lastSlot >= 0 {
+		if entry, ok := pn.Log.Get(lastSlot); ok {
+			if entry.ActionType == "ELIMINATE" {
+				// Already eliminated, now transition to night
+				pn.ProposePhaseChange(config.PhaseNight)
+				return
+			}
+		}
+	}
+
+	// Tally votes
+	tally := make(map[int]int)
+	for _, target := range s.Votes {
+		tally[target]++
+	}
+
+	// Find player with most votes
+	maxVotes := 0
+	eliminateTarget := -1
+	for id, count := range tally {
+		if count > maxVotes {
+			maxVotes = count
+			eliminateTarget = id
+		}
+	}
+
+	if eliminateTarget >= 0 {
+		log.Printf("[Coordinator] Vote tally: %v - eliminating player %d with %d votes",
+			tally, eliminateTarget, maxVotes)
+		pn.ProposeElimination(eliminateTarget)
+	}
+}
+
+// autoResolveNight checks if all night-action players have acted, then resolves.
+func (pn *PlayerNode) autoResolveNight() {
+	s := pn.State()
+
+	// Check if all Mafia and Doctor players have acted
+	pn.participationMu.RLock()
+	allActed := true
+	for _, p := range s.Players {
+		if !p.IsAlive {
+			continue
+		}
+		if p.Role == config.RoleMafia || p.Role == config.RoleDoctor {
+			if !pn.nightActed[p.NodeID] {
+				allActed = false
+				break
+			}
+		}
+	}
+	pn.participationMu.RUnlock()
+
+	if !allActed {
+		return // Wait for everyone
+	}
+
+	// Check if resolution already happened
+	lastSlot := pn.Log.NextSlot() - 1
+	if lastSlot >= 0 {
+		if entry, ok := pn.Log.Get(lastSlot); ok {
+			if entry.ActionType == "NIGHT_RESOLVE" {
+				// Already resolved, transition to day
+				pn.ProposePhaseChange(config.PhaseDay)
+				return
+			}
+		}
+	}
+
+	// Extract kill and protect targets from night actions
+	var killTarget, protectTarget *int
+	for _, action := range s.NightActions {
+		actionType, _ := action["action"].(string)
+		targetID, ok := networking.PayloadInt(action, "target_id")
+		if !ok {
+			continue
+		}
+
+		if actionType == "KILL" {
+			killTarget = &targetID
+		} else if actionType == "PROTECT" {
+			protectTarget = &targetID
+		}
+	}
+
+	log.Printf("[Coordinator] Night resolution: kill=%v protect=%v", killTarget, protectTarget)
+	pn.ProposeNightResolve(killTarget, protectTarget)
+}
+
+// ProposeGameReset resets the game back to LOBBY for a new round.
+func (pn *PlayerNode) ProposeGameReset() bool {
+	log.Printf("[Node %d] Proposing game reset", pn.NodeID)
+	return pn.Paxos.Propose(map[string]any{"reset": true}, "GAME_RESET", config.QuorumSize)
 }
 
 // DumpState returns a human-readable status string.

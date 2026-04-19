@@ -7,6 +7,7 @@ package game
 
 import (
 	"fmt"
+	"log"
 	"mafia-p2p/config"
 )
 
@@ -121,6 +122,8 @@ func (sm *StateMachine) Apply(actionType string, actorID int, payload map[string
 		sm.applyNightAction(actorID, payload)
 	case "NIGHT_RESOLVE":
 		sm.applyNightResolve(payload)
+	case "GAME_RESET":
+		sm.applyGameReset()
 	}
 
 	if winner := s.CheckWinCondition(); winner != "" {
@@ -193,6 +196,26 @@ func (sm *StateMachine) applyNightResolve(payload map[string]any) {
 		}
 	}
 	s.NightActions = nil
+}
+
+func (sm *StateMachine) applyGameReset() {
+	s := sm.State
+
+	// Reset all players to alive
+	for _, p := range s.Players {
+		p.IsAlive = true
+	}
+
+	// Reset game state
+	s.Phase = config.PhaseLobby
+	s.DayNumber = 0
+	s.RoundNumber = 0
+	s.Votes = make(map[int]int)
+	s.NightActions = nil
+	s.Announcements = nil
+	s.Winner = ""
+
+	log.Printf("[StateMachine] Game reset - back to LOBBY")
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
