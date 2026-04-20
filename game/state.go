@@ -165,6 +165,8 @@ func (sm *StateMachine) applyEliminate(payload map[string]any) {
 			p.IsAlive = false
 			s.Announcements = append(s.Announcements,
 				formatf("Player %d was eliminated by vote.", target))
+			// Remove any vote cast BY the eliminated player
+			delete(s.Votes, target)
 		}
 	}
 }

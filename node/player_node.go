@@ -649,8 +649,10 @@ func (pn *PlayerNode) autoTallyAndEliminate() {
 
 	// Tally votes
 	tally := make(map[int]int)
-	for _, target := range s.Votes {
-		tally[target]++
+	for voterID, target := range s.Votes {
+		if voter, ok := s.Players[voterID]; ok && voter.IsAlive {
+			tally[target]++
+		}
 	}
 
 	// Find player with most votes
@@ -717,24 +719,53 @@ func (pn *PlayerNode) autoResolveNight() {
 		}
 	}
 
-	// Extract kill and protect targets from night actions
+	// Determine the slot where the current NIGHT phase began.
+	nightStartSlot := pn.findLastPhaseChangeSlot(config.PhaseNight)
+
+	// Extract kill and protect targets by scanning the log from nightStartSlot onward.
 	var killTarget, protectTarget *int
-	for _, action := range s.NightActions {
-		actionType, _ := action["action"].(string)
-		targetID, ok := networking.PayloadInt(action, "target_id")
+	for slot := nightStartSlot; slot < pn.Log.NextSlot(); slot++ {
+		entry, ok := pn.Log.Get(slot)
+		if !ok {
+			continue
+		}
+		if entry.ActionType != "NIGHT_ACTION" {
+			continue
+		}
+
+		action, _ := entry.Payload["action"].(string)
+		targetID, ok := networking.PayloadInt(entry.Payload, "target_id")
 		if !ok {
 			continue
 		}
 
-		if actionType == "KILL" {
+		if action == "KILL" {
 			killTarget = &targetID
-		} else if actionType == "PROTECT" {
+		} else if action == "PROTECT" {
 			protectTarget = &targetID
 		}
 	}
 
 	log.Printf("[Coordinator] Night resolution: kill=%v protect=%v", killTarget, protectTarget)
 	pn.ProposeNightResolve(killTarget, protectTarget)
+}
+
+// findLastPhaseChangeSlot returns the slot index of the most recent PHASE_CHANGE
+// to the given phase, or 0 if none found.
+func (pn *PlayerNode) findLastPhaseChangeSlot(phase config.Phase) int {
+	for slot := pn.Log.NextSlot() - 1; slot >= 0; slot-- {
+		entry, ok := pn.Log.Get(slot)
+		if !ok {
+			continue
+		}
+		if entry.ActionType == "PHASE_CHANGE" {
+			toPhase, _ := entry.Payload["to_phase"].(string)
+			if toPhase == phase.String() {
+				return slot
+			}
+		}
+	}
+	return 0
 }
 
 // ProposeGameReset resets the game back to LOBBY for a new round.
