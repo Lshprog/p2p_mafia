@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"mafia-p2p/config"
+	"sync"
 )
 
 // PlayerInfo holds per-player runtime state.
@@ -99,6 +100,7 @@ func (s *GameState) CheckWinCondition() string {
 // StateMachine replays LogEntry values to build GameState incrementally.
 type StateMachine struct {
 	State *GameState
+	mu    sync.Mutex
 }
 
 // NewStateMachine creates a StateMachine seeded with the given role map.
@@ -108,6 +110,9 @@ func NewStateMachine(roleMap [config.NumNodes]config.Role) *StateMachine {
 
 // Apply advances the state by one committed log entry.
 func (sm *StateMachine) Apply(actionType string, actorID int, payload map[string]any) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
 	s := sm.State
 	switch actionType {
 	case "PHASE_CHANGE":

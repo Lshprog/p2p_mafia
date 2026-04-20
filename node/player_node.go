@@ -62,7 +62,9 @@ type PlayerNode struct {
 	// ── Game automation ──────────────────────────────────────────────────────
 	coordinatorStopCh chan struct{}
 
-	started bool
+	started         bool
+	highestSeenSlot int
+	seenSlotMu      sync.RWMutex
 }
 
 // NewPlayerNode constructs a fully wired PlayerNode for the given node ID.
@@ -168,27 +170,26 @@ func (pn *PlayerNode) Start() error {
 	// (in case we're rejoining after a disconnect)
 	go func() {
 		time.Sleep(2 * time.Second) // Wait for connections to establish
-		//request sync upon startup of node
-		log.Printf("[Node %d] Requesting sync as node starts", pn.NodeID)
-		pn.RequestSync()
-		// Periodically verify we haven't missed any entries
-		log.Printf("[Node %d] Periodic sync check", pn.NodeID)
-		go pn.periodicSyncCheck()
+		// Keep requesting sync until we have caught up.
+		for {
+			pn.RequestSync()
+			time.Sleep(2 * time.Second)
+			// If our log is as long as the highest seen committed slot, we're done.
+			if pn.Log.NextSlot()-1 >= pn.highestSeenSlot {
+				break
+			}
+		}
+		log.Printf("[Node %d] Sync complete. Current slot: %d", pn.NodeID, pn.Log.NextSlot()-1)
 	}()
 
 	return nil
 }
 
-func (pn *PlayerNode) periodicSyncCheck() {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-pn.coordinatorStopCh:
-			return
-		case <-ticker.C:
-			pn.RequestSync()
-		}
+func (pn *PlayerNode) updateHighestSeenSlot(slot int) {
+	pn.seenSlotMu.Lock()
+	defer pn.seenSlotMu.Unlock()
+	if slot > pn.highestSeenSlot {
+		pn.highestSeenSlot = slot
 	}
 }
 
@@ -422,6 +423,17 @@ func (pn *PlayerNode) trackParticipation(entry distributed.LogEntry) {
 
 func (pn *PlayerNode) onHeartbeat(msg networking.Message) {
 	pn.VC.Update(msg.VectorTS)
+	committedSlot, ok := networking.PayloadInt(msg.Payload, "committed_slot")
+	if !ok {
+		return
+	}
+	pn.updateHighestSeenSlot(committedSlot)
+	localMax := pn.Log.NextSlot() - 1
+	if committedSlot > localMax {
+		log.Printf("[Node %d] Behind (local=%d, peer=%d) - requesting sync",
+			pn.NodeID, localMax, committedSlot)
+		go pn.RequestSync()
+	}
 }
 
 func (pn *PlayerNode) onSpeakMsg(msg networking.Message) {
