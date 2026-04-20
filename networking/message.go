@@ -33,6 +33,11 @@ const (
 	MsgRARequest MsgType = "RA_REQUEST"
 	MsgRAReply   MsgType = "RA_REPLY"
 
+	// Leader Election (Bully)
+	MsgElection    MsgType = "ELECTION"
+	MsgAnswer      MsgType = "ANSWER"
+	MsgCoordinator MsgType = "COORDINATOR"
+
 	// Paxos
 	MsgPaxosPrepare  MsgType = "PAXOS_PREPARE"
 	MsgPaxosPromise  MsgType = "PAXOS_PROMISE"
@@ -70,8 +75,11 @@ func newMsg(t MsgType, senderID int, ts []int, payload map[string]any) Message {
 	}
 }
 
-func NewHeartbeat(senderID int, ts []int, aliveNodes []int) Message {
-	return newMsg(MsgHeartbeat, senderID, ts, map[string]any{"alive_nodes": aliveNodes})
+func NewHeartbeat(senderID int, ts []int, aliveNodes []int, committedSlot int) Message {
+	return newMsg(MsgHeartbeat, senderID, ts, map[string]any{
+		"alive_nodes":    aliveNodes,
+		"committed_slot": committedSlot,
+	})
 }
 
 func NewSyncRequest(senderID int, ts []int, fromSlot int) Message {
@@ -132,6 +140,21 @@ func NewNightAction(senderID int, ts []int, action string, targetID int) Message
 
 func NewPhaseChange(senderID int, ts []int, newPhase string) Message {
 	return newMsg(MsgPhaseChange, senderID, ts, map[string]any{"new_phase": newPhase})
+}
+
+// Bully Algo Functions
+
+// ── Bully Election ─────────────────────────────────────────────────────────
+func NewElection(senderID int, ts []int) Message {
+	return newMsg(MsgElection, senderID, ts, nil)
+}
+
+func NewAnswer(senderID int, ts []int) Message {
+	return newMsg(MsgAnswer, senderID, ts, nil)
+}
+
+func NewCoordinator(senderID int, ts []int, leaderID int) Message {
+	return newMsg(MsgCoordinator, senderID, ts, map[string]any{"leader_id": leaderID})
 }
 
 // ── Wire encoding: 4-byte length prefix + JSON body ──────────────────────────

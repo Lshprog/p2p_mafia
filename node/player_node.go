@@ -29,12 +29,13 @@ type PlayerNode struct {
 	NodeID int
 
 	// Distributed primitives
-	VC      *distributed.VectorClock
-	Log     *distributed.ActionLog
-	Network *networking.PeerNetwork
-	CsSpeak *distributed.RicartAgrawala
-	CsNight *distributed.RicartAgrawala
-	Paxos   *distributed.Paxos
+	VC       *distributed.VectorClock
+	Log      *distributed.ActionLog
+	Network  *networking.PeerNetwork
+	CsSpeak  *distributed.RicartAgrawala
+	CsNight  *distributed.RicartAgrawala
+	Paxos    *distributed.Paxos
+	Election *distributed.BullyElection
 
 	// Game logic
 	Role roles.Role
@@ -94,6 +95,8 @@ func NewPlayerNode(nodeID int, roleMap [config.NumNodes]config.Role) *PlayerNode
 		nightActed:        make(map[int]bool),
 		coordinatorStopCh: make(chan struct{}),
 	}
+	pn.Election = distributed.NewBullyElection(nodeID, net, vc)
+	pn.Election.Start()
 
 	// Register the Paxos commit callback — single source of truth for all state updates.
 	paxos.RegisterCallback(func(entry distributed.LogEntry) {
@@ -116,11 +119,21 @@ func (pn *PlayerNode) Start() error {
 
 	// Inject VC snapshot into heartbeat sender
 	pn.Network.SetVCCallback(pn.VC.Snapshot)
+	pn.Network.SetCommittedSlotCallback(func() int {
+		return pn.Log.NextSlot() - 1
+	})
 
 	// Notify RA instances when a peer dies
 	pn.Network.SetNodeDeadCallback(func(deadID int) {
 		pn.CsSpeak.NotifyNodeDead(deadID)
 		pn.CsNight.NotifyNodeDead(deadID)
+		// If the dead node was the leader, start an election
+		if deadID == pn.Election.GetLeader() {
+			go func() {
+				time.Sleep(2 * time.Second)
+				pn.Election.Start()
+			}()
+		}
 	})
 
 	// ── Register all message handlers ────────────────────────────────────────
@@ -155,14 +168,28 @@ func (pn *PlayerNode) Start() error {
 	// (in case we're rejoining after a disconnect)
 	go func() {
 		time.Sleep(2 * time.Second) // Wait for connections to establish
-		if pn.Log.Len() == 0 {
-			// Empty log means we might be behind, request sync
-			log.Printf("[Node %d] Empty log on startup, requesting sync", pn.NodeID)
-			pn.RequestSync()
-		}
+		//request sync upon startup of node
+		log.Printf("[Node %d] Requesting sync as node starts", pn.NodeID)
+		pn.RequestSync()
+		// Periodically verify we haven't missed any entries
+		log.Printf("[Node %d] Periodic sync check", pn.NodeID)
+		go pn.periodicSyncCheck()
 	}()
 
 	return nil
+}
+
+func (pn *PlayerNode) periodicSyncCheck() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-pn.coordinatorStopCh:
+			return
+		case <-ticker.C:
+			pn.RequestSync()
+		}
+	}
 }
 
 // Stop shuts down all connections and goroutines.
@@ -495,18 +522,8 @@ func (pn *PlayerNode) coordinatorLoop() {
 // shouldCoordinate returns true if this node should act as coordinator.
 // The lowest-ID alive node coordinates to avoid duplicate proposals.
 func (pn *PlayerNode) shouldCoordinate() bool {
-	alive := pn.State().AliveIDs()
-	if len(alive) == 0 {
-		return false
-	}
-	// Sort to find lowest ID
-	minID := alive[0]
-	for _, id := range alive {
-		if id < minID {
-			minID = id
-		}
-	}
-	return minID == pn.NodeID
+	leader := pn.Election.GetLeader()
+	return leader == pn.NodeID
 }
 
 // checkAndAdvanceGame checks current phase and advances the game if conditions are met.
