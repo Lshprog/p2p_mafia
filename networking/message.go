@@ -33,11 +33,6 @@ const (
 	MsgRARequest MsgType = "RA_REQUEST"
 	MsgRAReply   MsgType = "RA_REPLY"
 
-	// Leader Election (Bully)
-	MsgElection    MsgType = "ELECTION"
-	MsgAnswer      MsgType = "ANSWER"
-	MsgCoordinator MsgType = "COORDINATOR"
-
 	// Paxos
 	MsgPaxosPrepare  MsgType = "PAXOS_PREPARE"
 	MsgPaxosPromise  MsgType = "PAXOS_PROMISE"
@@ -140,21 +135,6 @@ func NewNightAction(senderID int, ts []int, action string, targetID int) Message
 
 func NewPhaseChange(senderID int, ts []int, newPhase string) Message {
 	return newMsg(MsgPhaseChange, senderID, ts, map[string]any{"new_phase": newPhase})
-}
-
-// Bully Algo Functions
-
-// ── Bully Election ─────────────────────────────────────────────────────────
-func NewElection(senderID int, ts []int) Message {
-	return newMsg(MsgElection, senderID, ts, nil)
-}
-
-func NewAnswer(senderID int, ts []int) Message {
-	return newMsg(MsgAnswer, senderID, ts, nil)
-}
-
-func NewCoordinator(senderID int, ts []int, leaderID int) Message {
-	return newMsg(MsgCoordinator, senderID, ts, map[string]any{"leader_id": leaderID})
 }
 
 // ── Wire encoding: 4-byte length prefix + JSON body ──────────────────────────

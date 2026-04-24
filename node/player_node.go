@@ -29,13 +29,12 @@ type PlayerNode struct {
 	NodeID int
 
 	// Distributed primitives
-	VC       *distributed.VectorClock
-	Log      *distributed.ActionLog
-	Network  *networking.PeerNetwork
-	CsSpeak  *distributed.RicartAgrawala
-	CsNight  *distributed.RicartAgrawala
-	Paxos    *distributed.Paxos
-	Election *distributed.BullyElection
+	VC      *distributed.VectorClock
+	Log     *distributed.ActionLog
+	Network *networking.PeerNetwork
+	CsSpeak *distributed.RicartAgrawala
+	CsNight *distributed.RicartAgrawala
+	Paxos   *distributed.Paxos
 
 	// Game logic
 	Role roles.Role
@@ -97,8 +96,6 @@ func NewPlayerNode(nodeID int, roleMap [config.NumNodes]config.Role) *PlayerNode
 		nightActed:        make(map[int]bool),
 		coordinatorStopCh: make(chan struct{}),
 	}
-	pn.Election = distributed.NewBullyElection(nodeID, net, vc)
-	pn.Election.Start()
 
 	// Register the Paxos commit callback — single source of truth for all state updates.
 	paxos.RegisterCallback(func(entry distributed.LogEntry) {
@@ -129,13 +126,6 @@ func (pn *PlayerNode) Start() error {
 	pn.Network.SetNodeDeadCallback(func(deadID int) {
 		pn.CsSpeak.NotifyNodeDead(deadID)
 		pn.CsNight.NotifyNodeDead(deadID)
-		// If the dead node was the leader, start an election
-		if deadID == pn.Election.GetLeader() {
-			go func() {
-				time.Sleep(2 * time.Second)
-				pn.Election.Start()
-			}()
-		}
 	})
 
 	// ── Register all message handlers ────────────────────────────────────────
@@ -534,8 +524,18 @@ func (pn *PlayerNode) coordinatorLoop() {
 // shouldCoordinate returns true if this node should act as coordinator.
 // The lowest-ID alive node coordinates to avoid duplicate proposals.
 func (pn *PlayerNode) shouldCoordinate() bool {
-	leader := pn.Election.GetLeader()
-	return leader == pn.NodeID
+	alive := pn.State().AliveIDs()
+	if len(alive) == 0 {
+		return false
+	}
+	// Sort to find lowest ID
+	minID := alive[0]
+	for _, id := range alive {
+		if id < minID {
+			minID = id
+		}
+	}
+	return minID == pn.NodeID
 }
 
 // checkAndAdvanceGame checks current phase and advances the game if conditions are met.
