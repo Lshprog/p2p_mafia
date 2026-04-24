@@ -129,6 +129,8 @@ func (sm *StateMachine) Apply(actionType string, actorID int, payload map[string
 		sm.applyNightResolve(payload)
 	case "GAME_RESET":
 		sm.applyGameReset()
+	case "PLAYER_CRASHED":
+		sm.applyPlayerCrashed(payload)
 	}
 
 	if winner := s.CheckWinCondition(); winner != "" {
@@ -173,6 +175,20 @@ func (sm *StateMachine) applyEliminate(payload map[string]any) {
 			// Remove any vote cast BY the eliminated player
 			delete(s.Votes, target)
 		}
+	}
+}
+
+func (sm *StateMachine) applyPlayerCrashed(payload map[string]any) {
+	s := sm.State
+	target, ok := payloadInt(payload, "target_id")
+	if !ok {
+		return
+	}
+	if p, exists := s.Players[target]; exists && p.IsAlive {
+		p.IsAlive = false
+		s.Announcements = append(s.Announcements,
+			formatf("Player %d disconnected and has been eliminated.", target))
+		delete(s.Votes, target)
 	}
 }
 

@@ -59,7 +59,7 @@ type PlayerNode struct {
 	nightActed      map[int]bool // Night participation
 
 	// ── Game automation ──────────────────────────────────────────────────────
-	coordinatorStopCh chan struct{}
+	automationStopCh chan struct{}
 
 	started         bool
 	highestSeenSlot int
@@ -83,18 +83,18 @@ func NewPlayerNode(nodeID int, roleMap [config.NumNodes]config.Role) *PlayerNode
 	sm := game.NewStateMachine(roleMap)
 
 	pn := &PlayerNode{
-		NodeID:            nodeID,
-		VC:                vc,
-		Log:               al,
-		Network:           net,
-		CsSpeak:           csSpeak,
-		CsNight:           csNight,
-		Paxos:             paxos,
-		Role:              myRole,
-		SM:                sm,
-		spokeOrVoted:      make(map[int]bool),
-		nightActed:        make(map[int]bool),
-		coordinatorStopCh: make(chan struct{}),
+		NodeID:           nodeID,
+		VC:               vc,
+		Log:              al,
+		Network:          net,
+		CsSpeak:          csSpeak,
+		CsNight:          csNight,
+		Paxos:            paxos,
+		Role:             myRole,
+		SM:               sm,
+		spokeOrVoted:     make(map[int]bool),
+		nightActed:       make(map[int]bool),
+		automationStopCh: make(chan struct{}),
 	}
 
 	// Register the Paxos commit callback — single source of truth for all state updates.
@@ -126,6 +126,20 @@ func (pn *PlayerNode) Start() error {
 	pn.Network.SetNodeDeadCallback(func(deadID int) {
 		pn.CsSpeak.NotifyNodeDead(deadID)
 		pn.CsNight.NotifyNodeDead(deadID)
+		// Propose elimination of the crashed player via Paxos.
+		// Only try if we are in an active game and the player is alive.
+		s := pn.State()
+		if s.Phase != config.PhaseLobby && s.Phase != config.PhaseEnded {
+			if p, ok := s.Players[deadID]; ok && p.IsAlive {
+				log.Printf("[Node %d] Peer %d crashed - proposing PLAYER_CRASHED",
+					pn.NodeID, deadID)
+				go pn.Paxos.Propose(
+					map[string]any{"target_id": deadID},
+					"PLAYER_CRASHED",
+					config.QuorumSize,
+				)
+			}
+		}
 	})
 
 	// ── Register all message handlers ────────────────────────────────────────
@@ -150,7 +164,7 @@ func (pn *PlayerNode) Start() error {
 	pn.Network.RegisterHandler(networking.MsgSyncResponse, pn.onSyncResponse)
 
 	// Start the game coordinator goroutine
-	go pn.coordinatorLoop()
+	go pn.startGameAutomation()
 
 	if err := pn.Network.Start(); err != nil {
 		return err
@@ -185,7 +199,7 @@ func (pn *PlayerNode) updateHighestSeenSlot(slot int) {
 
 // Stop shuts down all connections and goroutines.
 func (pn *PlayerNode) Stop() {
-	close(pn.coordinatorStopCh)
+	close(pn.automationStopCh)
 	pn.Network.Stop()
 	log.Printf("[Node %d] stopped", pn.NodeID)
 }
@@ -501,41 +515,21 @@ func (pn *PlayerNode) RequestSync() {
 }
 
 // ── Game Coordinator & Automation ─────────────────────────────────────────────
-
-// coordinatorLoop runs in background and orchestrates the game flow.
-// Only the lowest-ID alive node acts as coordinator to avoid duplicate proposals.
-func (pn *PlayerNode) coordinatorLoop() {
+// ── Game Automation ─────────────────────────────────────────────
+// Every node independently checks whether to advance the game.
+// Paxos ensures that even if multiple nodes propose a phase change
+// simultaneously, only one value is chosen for the next log slot.
+func (pn *PlayerNode) startGameAutomation() {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
-
 	for {
 		select {
-		case <-pn.coordinatorStopCh:
+		case <-pn.automationStopCh:
 			return
 		case <-ticker.C:
-			if !pn.shouldCoordinate() {
-				continue
-			}
 			pn.checkAndAdvanceGame()
 		}
 	}
-}
-
-// shouldCoordinate returns true if this node should act as coordinator.
-// The lowest-ID alive node coordinates to avoid duplicate proposals.
-func (pn *PlayerNode) shouldCoordinate() bool {
-	alive := pn.State().AliveIDs()
-	if len(alive) == 0 {
-		return false
-	}
-	// Sort to find lowest ID
-	minID := alive[0]
-	for _, id := range alive {
-		if id < minID {
-			minID = id
-		}
-	}
-	return minID == pn.NodeID
 }
 
 // checkAndAdvanceGame checks current phase and advances the game if conditions are met.
