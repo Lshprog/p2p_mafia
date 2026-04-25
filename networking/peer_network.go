@@ -39,8 +39,9 @@ type PeerNetwork struct {
 	lastSeen map[int]time.Time
 
 	// Callbacks
-	vcSnapshotFn func() []int // injected by PlayerNode
-	nodeDeadFn   func(int)   // injected by PlayerNode
+	vcSnapshotFn    func() []int // injected by PlayerNode
+	nodeDeadFn      func(int)    // injected by PlayerNode
+	committedSlotFn func() int
 
 	listener net.Listener
 	stopCh   chan struct{}
@@ -123,6 +124,10 @@ func (n *PeerNetwork) SetVCCallback(fn func() []int) { n.vcSnapshotFn = fn }
 // SetNodeDeadCallback is called when a peer is declared dead.
 func (n *PeerNetwork) SetNodeDeadCallback(fn func(int)) { n.nodeDeadFn = fn }
 
+func (n *PeerNetwork) SetCommittedSlotCallback(fn func() int) {
+	n.committedSlotFn = fn
+}
+
 // ── Send / Broadcast ──────────────────────────────────────────────────────────
 
 // Send unicasts msg to peerID. Returns false if the peer is unreachable.
@@ -170,6 +175,13 @@ func (n *PeerNetwork) AliveNodes() map[int]bool {
 		result[id] = alive
 	}
 	return result
+}
+
+// ConnectedPeerCount returns the number of peers with active TCP connections.
+func (n *PeerNetwork) ConnectedPeerCount() int {
+	n.peersMu.Lock()
+	defer n.peersMu.Unlock()
+	return len(n.peers)
 }
 
 // ── Server (inbound) ──────────────────────────────────────────────────────────
@@ -264,15 +276,22 @@ func (n *PeerNetwork) heartbeatLoop() {
 			} else {
 				ts = make([]int, config.NumNodes)
 			}
+
+			committed := 0
+			if n.committedSlotFn != nil {
+				committed = n.committedSlotFn()
+			}
+
 			n.aliveMu.RLock()
-			alive := make([]int, 0)
+			alive := make([]int, 0, len(n.alive))
 			for id, a := range n.alive {
 				if a {
 					alive = append(alive, id)
 				}
 			}
 			n.aliveMu.RUnlock()
-			hb := NewHeartbeat(n.NodeID, ts, alive)
+
+			hb := NewHeartbeat(n.NodeID, ts, alive, committed)
 			n.Broadcast(hb)
 		}
 	}

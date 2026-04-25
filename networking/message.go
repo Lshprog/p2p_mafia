@@ -70,8 +70,11 @@ func newMsg(t MsgType, senderID int, ts []int, payload map[string]any) Message {
 	}
 }
 
-func NewHeartbeat(senderID int, ts []int, aliveNodes []int) Message {
-	return newMsg(MsgHeartbeat, senderID, ts, map[string]any{"alive_nodes": aliveNodes})
+func NewHeartbeat(senderID int, ts []int, aliveNodes []int, committedSlot int) Message {
+	return newMsg(MsgHeartbeat, senderID, ts, map[string]any{
+		"alive_nodes":    aliveNodes,
+		"committed_slot": committedSlot,
+	})
 }
 
 func NewSyncRequest(senderID int, ts []int, fromSlot int) Message {
