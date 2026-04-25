@@ -64,6 +64,7 @@ type PlayerNode struct {
 	started         bool
 	highestSeenSlot int
 	seenSlotMu      sync.RWMutex
+	initialSyncDone int32
 }
 
 // NewPlayerNode constructs a fully wired PlayerNode for the given node ID.
@@ -95,6 +96,7 @@ func NewPlayerNode(nodeID int, roleMap [config.NumNodes]config.Role) *PlayerNode
 		spokeOrVoted:     make(map[int]bool),
 		nightActed:       make(map[int]bool),
 		automationStopCh: make(chan struct{}),
+		highestSeenSlot:  -1, // no slots seen yet
 	}
 
 	// Register the Paxos commit callback — single source of truth for all state updates.
@@ -183,6 +185,7 @@ func (pn *PlayerNode) Start() error {
 				break
 			}
 		}
+		pn.initialSyncDone = 1
 		log.Printf("[Node %d] Sync complete. Current slot: %d", pn.NodeID, pn.Log.NextSlot()-1)
 	}()
 
@@ -314,6 +317,10 @@ func (pn *PlayerNode) ProposePhaseChange(newPhase config.Phase) bool {
 	// ── Barrier check ─────────────────────────────────────────────────────────
 	// Get alive players from GAME STATE (not network heartbeat status)
 	gameState := pn.State()
+	if p, ok := gameState.Players[pn.NodeID]; ok && !p.IsAlive {
+		log.Printf("[Node %d] Dead node cannot propose phase change", pn.NodeID)
+		return false
+	}
 	alivePlayers := gameState.AlivePlayers()
 
 	// Get network alive status
@@ -500,6 +507,10 @@ func (pn *PlayerNode) onSyncResponse(msg networking.Message) {
 			VectorTS:   vts,
 			WallTime:   int64(wallTime),
 		}
+		// Check if entry is already committed
+		if entry.Slot < pn.Log.NextSlot() {
+			continue // skip already applied entries
+		}
 		pn.Log.CommitOrFill(entry)
 		pn.SM.Apply(entry.ActionType, entry.ActorID, entry.Payload)
 	}
@@ -534,7 +545,14 @@ func (pn *PlayerNode) startGameAutomation() {
 
 // checkAndAdvanceGame checks current phase and advances the game if conditions are met.
 func (pn *PlayerNode) checkAndAdvanceGame() {
+	if pn.initialSyncDone == 0 {
+		return // do nothing until sync finished
+	}
+
 	s := pn.State()
+	if p, ok := s.Players[pn.NodeID]; ok && !p.IsAlive {
+		return
+	}
 
 	// Check win condition first
 	if s.Winner != "" {
@@ -610,8 +628,7 @@ func (pn *PlayerNode) autoStartGame() {
 		if entry, ok := pn.Log.Get(lastSlot); ok {
 			if entry.ActionType == "GAME_RESET" {
 				shouldStart = true
-				// Use actual alive count for quorum, not fixed NumNodes
-				quorumToUse = aliveCount
+				quorumToUse = config.NumNodes
 			}
 		}
 	}
